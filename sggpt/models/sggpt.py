@@ -137,21 +137,22 @@ class SelfGenomeGPTPositionalEncoding(nn.Module):
         self.stride = config.conv_size // 2
         max_len = config.max_len // self.stride
 
-        position = torch.arange(max_len).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model)
+        self.register_buffer(
+            "position_ids",
+            torch.arange(max_len).expand((1, -1)),
+            persistent=False,
         )
-        pe = torch.zeros(max_len, 1, d_model)
-        pe[:, 0, 0::2] = torch.sin(position * div_term)
-        pe[:, 0, 1::2] = torch.cos(position * div_term)
-        self.register_buffer("pe", pe)
+        self.position_embeddings = nn.Embedding(max_len, d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Arguments:
-            x: Tensor, shape ``[seq_len, batch_size, embedding_dim]``
+            x: Tensor, shape ``[batch_size, seq_len, embedding_dim]``
         """
-        x = x + self.pe[: x.size(0)]
+        seq_length = x.size(1)
+        position_ids = self.position_ids[:, :seq_length]
+        position_embeddings = self.position_embeddings(position_ids)
+        x += position_embeddings
         return x
 
 
