@@ -1,0 +1,250 @@
+import json
+import math
+from dataclasses import dataclass
+from pathlib import Path
+
+import torch
+from einops import rearrange
+from flash_attn import flash_attn_qkvpacked_func
+from torch import nn
+from torch.nn import functional as F
+
+
+@dataclass
+class SelfGenomeGPTConfig:
+    conv_size: int = 40
+    d_model: int = 256
+    n_heads: int = 4
+    intermediate_size: int = 1024
+    n_layers: int = 4
+    norm_eps: float = 1e-12
+    max_len: int = 1000
+    initializer_range: float = 0.02
+    attention_dropout: float = 0.0
+    mlp_dropout: float = 0.0
+
+    def __post_init__(self):
+        assert self.d_model % self.n_heads == 0, "d_model must be divisible by n_heads"
+        assert self.initializer_range > 0.0, "initializer_range must be positive"
+        assert (
+            0.0 <= self.attention_dropout < 1.0
+        ), "attention_dropout must be in [0, 1)"
+        assert 0.0 <= self.mlp_dropout < 1.0, "mlp_dropout must be in [0, 1)"
+        assert self.norm_eps > 0.0, "norm_eps must be positive"
+        assert self.conv_size % 2 == 0, "conv_size must be divisible by 2"
+
+    @classmethod
+    def from_pretrained(cls, model_path: str):
+        """This method is used to load a pretrained model configuration from a given path.
+
+        Args:
+            model_path (str): The path to the directory containing the pretrained model's configuration file.
+
+        Returns:
+            KiruaConfig: An instance of KiruaConfig initialized with the values from the pretrained model's configuration.
+        """
+        model_dir = Path(model_path)
+        with open(model_dir / "config.json", "r") as f:
+            config_dict = json.load(f)
+        return cls(**config_dict)
+
+
+@torch.no_grad()
+def init_weights_impl(module, initializer_range: float):
+    """Initialize the weights"""
+    if isinstance(module, nn.Linear) or isinstance(module, nn.Conv1d):
+        # Slightly different from the TF version which uses truncated_normal for initialization
+        # cf https://github.com/pytorch/pytorch/pull/5617
+        module.weight.data.normal_(mean=0.0, std=initializer_range)
+        if module.bias is not None:
+            module.bias.data.zero_()
+    elif isinstance(module, nn.LayerNorm):
+        module.bias.data.zero_()
+        module.weight.data.fill_(1.0)
+
+
+class SelfGenomeGPTFFN(nn.Module):
+    def __init__(self, config: SelfGenomeGPTConfig):
+        super().__init__()
+        self.config = config
+        d_model = config.d_model
+        intermediate_size = config.intermediate_size
+        dropout = config.mlp_dropout
+        self.lin1 = nn.Linear(d_model, intermediate_size, bias=False)
+        self.lin2 = nn.Linear(intermediate_size, d_model, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        return self.lin2(self.dropout(F.silu(self.lin1(x))))
+
+
+class SelfGenomeGPTCausalSelfAttention(nn.Module):
+    def __init__(self, config: SelfGenomeGPTConfig):
+        super().__init__()
+        self.config = config
+        d_model = config.d_model
+        self.Wqkv = nn.Linear(d_model, 3 * d_model, bias=False)
+        self.Wout = nn.Linear(d_model, d_model, bias=False)
+
+    def forward(self, x):
+        qkv = self.Wqkv(x)
+        qkv = rearrange(
+            qkv, "... (three h d) -> ... three h d", three=3, h=self.config.n_heads
+        )
+        attn_out = flash_attn_qkvpacked_func(
+            qkv,
+            dropout_p=self.config.attention_dropout if self.training else 0.0,
+            causal=True,
+        )
+        out = self.Wout(rearrange(attn_out, "... h d -> ... (h d)"))
+        return out
+
+
+class SelfGenomeGPTLayer(nn.Module):
+    def __init__(self, config: SelfGenomeGPTConfig):
+        super().__init__()
+        self.config = config
+        self.norm1 = nn.LayerNorm(config.d_model, eps=config.norm_eps)
+        self.norm2 = nn.LayerNorm(config.d_model, eps=config.norm_eps)
+        self.attn = SelfGenomeGPTCausalSelfAttention(config)
+        self.ffn = SelfGenomeGPTFFN(config)
+
+    def forward(self, x):
+        hid = self.attn(self.norm1(x)) + x
+        out = self.ffn(self.norm2(hid)) + hid
+        return out
+
+
+class SelfGenomeGPTMLPHead(nn.Module):
+    def __init__(self, config: SelfGenomeGPTConfig):
+        super().__init__()
+        self.config = config
+        self.mlp = nn.Sequential(
+            nn.Linear(config.d_model, config.d_model),
+            nn.SiLU(),
+            nn.Linear(config.d_model, config.d_model),
+        )
+
+    def forward(self, x):
+        return self.mlp(x)
+
+
+class SelfGenomeGPTPositionalEncoding(nn.Module):
+    def __init__(self, config: SelfGenomeGPTConfig):
+        super().__init__()
+        self.config = config
+        d_model = config.d_model
+        self.stride = config.conv_size // 2
+        max_len = config.max_len // self.stride
+
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model)
+        )
+        pe = torch.zeros(max_len, 1, d_model)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("pe", pe)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Arguments:
+            x: Tensor, shape ``[seq_len, batch_size, embedding_dim]``
+        """
+        x = x + self.pe[: x.size(0)]
+        return x
+
+
+@dataclass
+class SelfGenomeGPTOutput:
+    hidden_states: torch.Tensor
+    head_logits: torch.Tensor
+
+
+class SelfGenomeGPT(nn.Module):
+    def __init__(self, config: SelfGenomeGPTConfig):
+        super().__init__()
+        self.config = config
+        self.stride = config.conv_size // 2
+        self.in_conv = nn.Conv1d(
+            in_channels=4,
+            out_channels=config.d_model,
+            kernel_size=config.conv_size,
+            stride=self.stride,
+            padding=self.stride,
+        )
+        self.pos_encoding = SelfGenomeGPTPositionalEncoding(config)
+        self.layers = nn.ModuleList(
+            [SelfGenomeGPTLayer(config) for _ in range(config.n_layers)]
+        )
+        self.out_norm = nn.LayerNorm(config.d_model, eps=config.norm_eps)
+        self.head = SelfGenomeGPTMLPHead(config)
+
+    def forward(self, x: torch.LongTensor) -> SelfGenomeGPTOutput:
+        """SelfGenomeGPT forward pass
+
+        Args:
+            x (torch.LongTensor): Input tensor of shape (batch_size, seq_len)
+
+        Returns:
+            SelfGenomeGPTOutput: Output of the model, including hidden states and head logits
+        """
+        bs, seqlen = x.shape
+        seqlen_for_transformer = seqlen // self.stride
+
+        x_onehot = F.one_hot(x, num_classes=4)
+        x_input = rearrange(x_onehot, "b l c -> b c l").float()  # for conv1d
+        x_input = self.in_conv(x_input)[:, :, 1:]
+        x_input = rearrange(
+            x_input, "b c l -> b l c"
+        )  # back to (batch_size, seq_len, d_model)
+
+        x_input = self.pos_encoding(x_input)
+
+        for layer in self.layers:
+            x_input = layer(x_input)
+        x_input = self.out_norm(x_input)
+
+        out = SelfGenomeGPTOutput(hidden_states=x_input, head_logits=self.head(x_input))
+        return out
+
+    def save_pretrained(self, save_directory: str):
+        """Save a model and its configuration file to a directory, so that it can be re-loaded using the `from_pretrained` class method.
+
+        Args:
+            save_directory (str): Directory to which to save the model.
+        """
+        model_dir = Path(save_directory)
+        model_dir.mkdir(parents=True, exist_ok=True)
+        with open(model_dir / "config.json", "w") as f:
+            json.dump(self.config.__dict__, f, indent=2)
+        torch.save(self.state_dict(), model_dir / "model.pth")
+
+    @classmethod
+    def from_pretrained(cls, model_path: str):
+        """This method is used to load a pretrained model from a given path.
+
+        Args:
+            model_path (str): The path to the directory containing the pretrained model's configuration file.
+
+        Returns:
+            Kirua: An instance of Kirua initialized with the weights from the pretrained model.
+        """
+        model_dir = Path(model_path)
+        config = SelfGenomeGPTConfig.from_pretrained(model_path)
+        model = cls(config)
+        model.load_state_dict(torch.load(model_dir / "model.pth", map_location="cpu"))
+        return model
+
+    @classmethod
+    def from_config(cls, config: SelfGenomeGPTConfig):
+        """This method is used to load a pretrained model from a given path.
+
+        Args:
+            model_path (str): The path to the directory containing the pretrained model's configuration file.
+
+        Returns:
+            Kirua: An instance of Kirua initialized with the weights from the pretrained model.
+        """
+        model = cls(config)
+        return model
