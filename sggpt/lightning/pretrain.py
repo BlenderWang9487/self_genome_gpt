@@ -86,7 +86,7 @@ class PretrainSelfGenomeGPT(LightningModule):
         b = b[b_idx]
 
         logits = torch.bmm(f, b)  # (max len - 2, batch, batch)
-        logits = rearrange(logits, "l b b -> (l b) b")
+        logits = rearrange(logits, "l a b -> (l a) b")
 
         target = repeat(torch.arange(batch_size, device=f.device), "b -> (l b)", l=l)
         loss = self.loss_fn(
@@ -131,7 +131,11 @@ class PretrainSelfGenomeGPT(LightningModule):
             eps=self.pretrain_config.adamw_eps,
             weight_decay=self.pretrain_config.weight_decay,
         )
-        training_steps = len(self.train_ds) // self.pretrain_config.global_batch_size
+        training_steps = (
+            len(self.train_ds)
+            // self.pretrain_config.global_batch_size
+            * self.pretrain_config.n_epochs
+        )
         lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
             optimizer=optim,
             lr_lambda=partial(

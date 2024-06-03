@@ -10,7 +10,7 @@ def rev_comp(int_seq: np.ndarray) -> np.ndarray:
 
 class PretrainCollator:
     def __init__(self):
-        self.str2int = np.vectorize(lambda x: NUC_MAP[x])
+        self.str2int = np.vectorize(lambda x: NUC_MAP[x] if x in NUC_MAP else 0)
 
     def __call__(self, example: dict):
         seq = example["sequence"]
