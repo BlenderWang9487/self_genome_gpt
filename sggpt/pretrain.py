@@ -49,6 +49,7 @@ def train(
     initializer_range: float = 0.02,
     attention_dropout: float = 0.0,
     mlp_dropout: float = 0.0,
+    attn_impl: str = "flash",
     # logger config
     logdir: Path = Path("./data/mammoth/logs/pretrain"),
     log_step: int = 20,
@@ -98,6 +99,7 @@ def train(
         initializer_range=initializer_range,
         attention_dropout=attention_dropout,
         mlp_dropout=mlp_dropout,
+        attn_impl=attn_impl,
     )
     module = PretrainSelfGenomeGPT(
         sggpt_config=sggpt_config.__dict__, pretrain_config=pretrain_config.__dict__
