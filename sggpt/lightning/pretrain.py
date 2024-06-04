@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from functools import partial
+from pathlib import Path
 
 import datasets
 import torch
@@ -46,7 +47,17 @@ class PretrainSelfGenomeGPT(LightningModule):
 
         self.loss_fn = nn.CrossEntropyLoss()
 
-        ds = datasets.load_from_disk(self.pretrain_config.dataset_path)
+        ds_path = Path(self.pretrain_config.dataset_path)
+        if ds_path.exists():
+            ds = datasets.load_from_disk(self.pretrain_config.dataset_path)
+        else:
+            ds = datasets.load_dataset(self.pretrain_config.dataset_path)
+            if isinstance(ds, datasets.DatasetDict) and "train" in ds:
+                ds = ds["train"]
+            else:
+                raise ValueError(
+                    f"Invalid dataset path: {self.pretrain_config.dataset_path}"
+                )
         split_ds = ds.train_test_split(
             test_size=self.pretrain_config.valid_ratio,
             shuffle=True,
