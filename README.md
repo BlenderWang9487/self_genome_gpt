@@ -1,3 +1,8 @@
+# SelfGenomeGPT
+
+inspired by Self-GenomeNet
+Transformer sequence contrastive learning with Reverse-Complement neighbor
+
 # model upload 
 
 ```bash

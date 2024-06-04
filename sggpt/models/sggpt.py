@@ -5,7 +5,11 @@ from pathlib import Path
 
 import torch
 from einops import rearrange
-from flash_attn import flash_attn_qkvpacked_func
+
+try:
+    from flash_attn import flash_attn_qkvpacked_func
+except ImportError:
+    flash_attn_qkvpacked_func = None
 from torch import nn
 from torch.nn import functional as F
 
@@ -22,6 +26,7 @@ class SelfGenomeGPTConfig:
     initializer_range: float = 0.02
     attention_dropout: float = 0.0
     mlp_dropout: float = 0.0
+    attn_impl: str = "flash"  # 'sdpa' or 'flash' or 'slow'
 
     def __post_init__(self):
         assert self.d_model % self.n_heads == 0, "d_model must be divisible by n_heads"
@@ -81,22 +86,61 @@ class SelfGenomeGPTFFN(nn.Module):
 class SelfGenomeGPTCausalSelfAttention(nn.Module):
     def __init__(self, config: SelfGenomeGPTConfig):
         super().__init__()
+        if config.attn_impl == "flash":
+            assert (
+                flash_attn_qkvpacked_func is not None
+            ), "flash_attn must be installed if using flash_attn"
+
         self.config = config
         d_model = config.d_model
         self.Wqkv = nn.Linear(d_model, 3 * d_model, bias=False)
         self.Wout = nn.Linear(d_model, d_model, bias=False)
 
-    def forward(self, x):
-        qkv = self.Wqkv(x)
+        if config.attn_impl == "flash":
+            self.qkv_forwar_fn = self._flash_attn_forward
+        elif config.attn_impl == "sdpa":
+            self.qkv_forwar_fn = self._sdpa_forward
+        else:
+            raise ValueError(f"Unknown attention implementation: {config.attn_impl}")
+
+    def _sdpa_forward(self, qkv_packed: torch.Tensor):
+        """
+        qkv_packed: shape (batch_size, seq_len, 3 * d_model)
+        """
         qkv = rearrange(
-            qkv, "... (three h d) -> ... three h d", three=3, h=self.config.n_heads
+            qkv_packed,
+            "... l (three h d) -> ... three h l d",
+            three=3,
+            h=self.config.n_heads,
+        )  # (batch_size, 3, n_heads, seq_len, head_dim)
+        q, k, v = qkv.unbind(dim=1)
+        out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            dropout_p=self.config.attention_dropout if self.training else 0.0,
+            is_causal=True,
+        )  # (batch_size, n_heads, seq_len, head_dim)
+        return rearrange(out, "... h l d -> ... l (h d)")
+
+    def _flash_attn_forward(self, qkv_packed: torch.Tensor):
+        qkv = rearrange(
+            qkv_packed,
+            "... (three h d) -> ... three h d",
+            three=3,
+            h=self.config.n_heads,
         )
         attn_out = flash_attn_qkvpacked_func(
             qkv,
             dropout_p=self.config.attention_dropout if self.training else 0.0,
             causal=True,
         )
-        out = self.Wout(rearrange(attn_out, "... h d -> ... (h d)"))
+        return rearrange(attn_out, "... h d -> ... (h d)")
+
+    def forward(self, x):
+        qkv = self.Wqkv(x)
+        attn_out = self.qkv_forwar_fn(qkv)
+        out = self.Wout(attn_out)
         return out
 
 
