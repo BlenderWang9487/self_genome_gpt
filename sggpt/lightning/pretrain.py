@@ -63,7 +63,7 @@ class PretrainSelfGenomeGPT(LightningModule):
             "collate_fn": self.collator.batch,
         }
 
-    def forward(self, x):
+    def forward(self, x: torch.LongTensor):
         out = self.model.forward(x)
         normed_logits = nn.functional.normalize(out.head_logits, dim=-1)
         foward_strand_logits, reverse_strand_logits = torch.chunk(
@@ -73,22 +73,52 @@ class PretrainSelfGenomeGPT(LightningModule):
         reverse_strand_logits = rearrange(reverse_strand_logits, "b l c -> l c b")
         return foward_strand_logits, reverse_strand_logits
 
-    def contrastive_loss(self, f, b):
-        max_len = f.shape[0]  # e.g. 8
+    def contrastive_loss(self, f: torch.Tensor, b: torch.Tensor):
+        """
+        f: (seq_len, batch, hidden)
+        b: (seq_len, hidden, batch)
+        """
+        transformer_max_len = f.shape[0]  # e.g. 8
         batch_size = f.shape[1]
-        f = f[:-2]  # e.g. (012345)67
-        # b is        e.g. 76(543210)
 
-        l = f.shape[0]
+        ## if original seq is:
+        #   ABCDEFGH
+        ## seqlen = 8 and conv size = 2
+        ## and the transformer_seqlen will be (8 / (2 / 2)) - 1 = 7
 
-        b_idx = torch.arange(f.shape[0], device=f.device) + 2
-        b_idx = (max_len - 1) - b_idx
-        b = b[b_idx]
+        ## then the forward stran on the seqlen dim will get the information of:
+        #   0  1  2  3  4  5  6
+        #   AB BC CD DE EF FG GH
 
-        logits = torch.bmm(f, b)  # (max len - 2, batch, batch)
+        ## and the reverse strand will get the information of: (- means reverse complement)
+        #   0   1   2   3   4   5   6
+        #   -HG -GF -FE -ED -DC -CB -BA
+
+        ## so the embedding we want to contrast is those not leaked by the conv size,
+        ## but can compose to the original seq
+        ## for example, if we take the forward[2, CD] element, the target (non overlapped)
+        ## should be the reverse strand of forward[4, EF] (which is 2 + 2) element
+        ## so the target should be reverse[2, -FE]
+
+        ## based on the above derivation, we know the Fsrc-Rtarget index formula is:
+        ## idx_reverse = (transformer_seqlen - 1) - (idx_forward + 2)
+        ##             = (transformer_seqlen - 3) - idx_forward
+        ##             = (7 - 3) - 2 = 2
+
+        f = f[:-2]
+        valid_l = f.shape[0]
+
+        f_idx = torch.arange(valid_l, device=f.device)
+
+        b_idx = (transformer_max_len - 3) - f_idx
+        b = b[b_idx]  # re-index the reverse strand
+
+        logits = torch.bmm(f, b)  # (valid_l, batch, batch)
         logits = rearrange(logits, "l a b -> (l a) b")
 
-        target = repeat(torch.arange(batch_size, device=f.device), "b -> (l b)", l=l)
+        target = repeat(
+            torch.arange(batch_size, device=f.device), "b -> (l b)", l=valid_l
+        )
         loss = self.loss_fn(
             logits,
             target,

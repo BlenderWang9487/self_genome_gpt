@@ -28,6 +28,18 @@ class SelfGenomeGPTConfig:
     mlp_dropout: float = 0.0
     attn_impl: str = "flash"  # 'sdpa' or 'flash' or 'slow'
 
+    @property
+    def stride(self):
+        return self.conv_size // 2
+
+    @property
+    def transformer_max_len(self):
+        """max_len is the input DNA sequence max length
+        but transformer_max_len is the max length of the transformer input
+            (which is the max len after conv1d)
+        """
+        return (self.max_len // self.stride) - 1
+
     def __post_init__(self):
         assert self.d_model % self.n_heads == 0, "d_model must be divisible by n_heads"
         assert self.initializer_range > 0.0, "initializer_range must be positive"
@@ -178,15 +190,14 @@ class SelfGenomeGPTPositionalEncoding(nn.Module):
         super().__init__()
         self.config = config
         d_model = config.d_model
-        self.stride = config.conv_size // 2
-        max_len = config.max_len // self.stride
+        self.transformer_max_len = config.transformer_max_len
 
         self.register_buffer(
             "position_ids",
-            torch.arange(max_len).expand((1, -1)),
+            torch.arange(self.transformer_max_len).expand((1, -1)),
             persistent=False,
         )
-        self.position_embeddings = nn.Embedding(max_len, d_model)
+        self.position_embeddings = nn.Embedding(self.transformer_max_len, d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -210,19 +221,24 @@ class SelfGenomeGPT(nn.Module):
     def __init__(self, config: SelfGenomeGPTConfig):
         super().__init__()
         self.config = config
-        self.stride = config.conv_size // 2
+        self.stride = config.stride
+        self.transformer_max_len = config.transformer_max_len
+
         self.in_conv = nn.Conv1d(
             in_channels=4,
             out_channels=config.d_model,
             kernel_size=config.conv_size,
             stride=self.stride,
-            padding=self.stride,
         )
+
         self.pos_encoding = SelfGenomeGPTPositionalEncoding(config)
+
         self.layers = nn.ModuleList(
             [SelfGenomeGPTLayer(config) for _ in range(config.n_layers)]
         )
+
         self.out_norm = nn.LayerNorm(config.d_model, eps=config.norm_eps)
+
         self.head = SelfGenomeGPTMLPHead(config)
 
     def forward(self, x: torch.LongTensor) -> SelfGenomeGPTOutput:
@@ -234,12 +250,11 @@ class SelfGenomeGPT(nn.Module):
         Returns:
             SelfGenomeGPTOutput: Output of the model, including hidden states and head logits
         """
-        bs, seqlen = x.shape
-        seqlen_for_transformer = seqlen // self.stride
-
         x_onehot = F.one_hot(x, num_classes=4)
         x_input = rearrange(x_onehot, "b l c -> b c l").float()  # for conv1d
-        x_input = self.in_conv(x_input)[:, :, 1:]
+
+        # FIXME: this part might be wrong, need to check grad
+        x_input = self.in_conv(x_input)
         x_input = rearrange(
             x_input, "b c l -> b l c"
         )  # back to (batch_size, seq_len, d_model)
