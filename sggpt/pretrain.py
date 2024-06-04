@@ -17,7 +17,7 @@ from .lightning.pretrain import (
     PretrainSelfGenomeGPT,
     SelfGenomeGPTConfig,
 )
-from .utils.helpers import get_time_str
+from .utils.helpers import check_colab, get_time_str
 
 app = typer.Typer(pretty_exceptions_enable=False)
 
@@ -71,6 +71,7 @@ def train(
     version = get_time_str()
     logdir.mkdir(exist_ok=True, parents=True)
     wandb.login()
+    is_running_in_colab = check_colab()
 
     print("version:", version)
     pretrain_config = PretrainConfig(
@@ -128,14 +129,14 @@ def train(
         save_last="link",
         mode="min",
     )
-    rich_progress_bar = RichProgressBar()
     rich_model_summary = RichModelSummary(max_depth=2)
     callbacks = [
         model_checkpoint,
         lr_monitor,
-        rich_progress_bar,
         rich_model_summary,
     ]
+    if not is_running_in_colab:
+        callbacks.append(RichProgressBar())
 
     print("-- setup trainer --")
     trainer = pl.Trainer(
